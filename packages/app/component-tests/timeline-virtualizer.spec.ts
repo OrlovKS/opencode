@@ -62,7 +62,7 @@ story("treats the reachable end as the end under page zoom", async ({ page }) =>
   await page.evaluate(async (fixture) => {
     document.documentElement.style.zoom = "1.1"
     const { mountTimelineVirtualizer } = await import(fixture)
-    mountTimelineVirtualizer({ count: 4, rowHeight: 60.3, immediate: true, viewportHeight: 200.5 })
+    mountTimelineVirtualizer({ count: 4, rowHeight: 59.3, immediate: true, viewportHeight: 200.5 })
   }, fixture)
   const root = page.getByTestId("timeline-virtualizer-fixture")
   const content = root.locator("[data-timeline-virtual-content]")
