@@ -206,7 +206,7 @@ const everything = AIClient.layerWith(logged) // or AI.make({ layer: logged })
 ## Venice AI
 
 `Venice` provides native Chat Completions with streaming tools and reasoning. `model` and `chat`
-select the same API; credentials default to `VENICE_API_KEY`.
+select the same API, and `responses` selects its Responses API; credentials default to `VENICE_API_KEY`.
 
 ```ts
 import { LLM } from "@opencode/ai/effect"
@@ -235,8 +235,8 @@ signatures, including per-tool signatures. Venice's encrypted scalar trailers ar
 reasoning but retained in provider metadata for replay. Cache affinity uses `promptCacheKey`, and cache-write
 usage reads Venice's `cache_creation_input_tokens` field.
 
-The native package entrypoint is `@opencode/ai/providers/venice`. Image generation, embeddings, Responses, and
-client-side E2EE are not implemented by this provider.
+The native package entrypoints are `@opencode/ai/providers/venice` and `@opencode/ai/providers/venice/responses`.
+Image generation, embeddings, and client-side E2EE are not implemented by this provider.
 
 ## Decisions
 
@@ -701,18 +701,14 @@ table before swapping only the `model`:
 | Provider              | `n` | `aspect`             | `resolution`          | `images`                         | Moved to `providerOptions`                         |
 | --------------------- | --- | -------------------- | --------------------- | -------------------------------- | -------------------------------------------------- |
 | OpenAI                | ✓¹  | nearest size         | nearest size          | ✓                                | `size`, `outputFormat`, `mask`                     |
-| Google (Gemini)       | 1   | ✓                    | ✓ (`imageSize`)       | ✓ (no public URLs)               | `seed`                                             |
+| Google (Gemini)       | 1   | ✓                    | ✓ (`0.5K` as `512`)   | ✓ (no public URLs)               | `seed`                                             |
 | xAI                   | ✓   | ✓                    | `1k`/`2k`             | ✓                                | none                                               |
 | Meta                  | ✓   | ✓ (hint)             | ignored               | ✓                                | `size`, `outputFormat`                             |
 | Z.ai                  | ✗   | width × height       | width × height        | ✗                                | `size`                                             |
 | Alibaba               | ✓   | width × height       | width × height        | ✓                                | `size`, `seed`                                     |
 | MiniMax               | ✓   | preset or w × h⁴     | preset or w × h⁴      | 1 (portrait subject)             | `aspect_ratio`, `width`, `height`, `seed`          |
-| Black Forest Labs     | 1   | per model            | width × height models | per model (1–8)                  | `width`, `height`, `seed`, `output_format`, `mask` |
-| fal                   | ✓   | per model            | per model             | 1 (several on `/edit`, `/multi`) | `image_size`, `seed`, `output_format`, `mask`      |
-| Replicate             | ✗   | ✗                    | ✗                     | ✗ (use `providerOptions`)        | everything                                         |
-| Stability `image`     | 1   | ✓                    | ✗                     | 1 (not on `core`)                | `seed`, `output_format`                            |
-| Stability `upscale()` | ✗   | ✗                    | ✗                     | exactly 1 (required)             | `seed`, `output_format`                            |
 | Vercel AI Gateway     | ✓   | as OpenAI³           | as OpenAI³            | per model                        | as OpenAI                                          |
+| OpenRouter            | ✓   | ✓ (`aspect_ratio`)   | tier⁵                 | per model⁵                       | `size`, `outputFormat` (no `mask`)                 |
 | Cloudflare Workers AI | 1   | width × height²      | width × height²       | ✗                                | `width`, `height`, `seed`                          |
 
 ✓ lowers natively; ✗ fails whenever the field is set (including `n: 1`); `1` means `n > 1` fails. "width × height"
@@ -722,8 +718,11 @@ fixed sizes. `providerOptions.size` replaces `aspect` and `resolution`, so setti
 forwards `outputFormat` but does not apply it, so the returned bytes keep the upstream model's own format. ² Workers AI
 `@cf/black-forest-labs/flux-1-schnell` takes no size, and the provider rejects it. ³ Non-OpenAI gateway models
 (`bfl/flux-2-pro`) get a computed width × height, which the gateway passes through; models with a fixed list, such as
-Recraft, reject sizes outside it. ⁴ MiniMax sends its `aspect_ratio` preset for a preset aspect at about `1K` and an
+Recraft, reject sizes outside it. Grok (`spacexai/*`, `xai/*`) ignores `size`, so it gets `providerOptions.xai`
+`aspect_ratio` and `1k`/`2k` instead. ⁴ MiniMax sends its `aspect_ratio` preset for a preset aspect at about `1K` and an
 exact width × height (512–2048 px, steps of 8) otherwise; `image-01-live` takes only the presets, minus `21:9`.
+⁵ OpenRouter takes `512`, `768`, `1K`, `1.5K`, `2K` or `4K` rather than pixels; other values are left out. It has no
+edits endpoint, so input images go to `/images/generations` as `input_references` (data URLs or http(s) URLs).
 
 `Media.Asset` is the one asset type shared by image requests, image responses, LLM messages, and tool results.
 `asset.source` is the serializable `Media.Source` (`bytes`, `base64`, `url`, or `ref`); `asset.bytes()`,
@@ -756,7 +755,7 @@ returns a ref yet, and `asset.bytes()` / `materialize()` on a ref fail by design
 image inputs, avoiding ambiguity between base64, URLs, and provider IDs. Empty or omitted `images` uses text-to-image generation; a
 non-empty array selects the provider's edit behavior (see the table above for routes that limit the count). OpenAI
 uses multipart for byte/data-URL edits and its JSON reference body for URL or file-ID edits. Inpainting is a
-provider option on the routes that support it (OpenAI, fal, and BFL `flux-pro-1.0-fill`):
+provider option on the routes that support it (OpenAI):
 
 ```ts
 const inpainted = Image.generate({
@@ -890,49 +889,6 @@ const previews = Image.stream({
 
 The provider may send fewer previews than requested when the final image is ready first.
 
-### Queued image providers
-
-Black Forest Labs, fal, Replicate, and Stability's creative upscaler are submit-then-poll routes. `Image.generate`
-and `Image.stream` poll for you (pass `{ poll }` to tune the interval and timeout); `Image.start` returns a
-`Generation` whose `token` is serializable JSON for `Image.resume` in another process:
-
-```ts
-import { BlackForestLabs, Stability } from "@opencode/ai/providers"
-
-const bfl = BlackForestLabs.configure({ apiKey: process.env.BFL_API_KEY })
-
-const submit = Effect.gen(function* () {
-  const generation = yield* Image.start({ model: bfl.image("flux-2-pro"), prompt, aspect: "4:3" })
-  persist({ provider: "black-forest-labs", modelID: "flux-2-pro", token: generation.token })
-})
-
-const finish = Effect.gen(function* () {
-  const saved = load()
-  const resumed = yield* Image.resume(bfl.image(saved.modelID), saved.token)
-  return yield* resumed.await({ poll: { interval: "2 seconds" } })
-})
-```
-
-The token carries no route identity, so persist the provider and model ID alongside it: `resume` needs the model.
-
-- **Black Forest Labs** — results are downloaded before returning, because `result.sample` expires in 10 minutes.
-- **Replicate** — inputs are model-defined, so only `prompt` lowers: sizing, count, seed, format, and files go in
-  `providerOptions` under the model's names, with files as `Media.Asset` (data URLs up to 256 KB, larger by URL).
-  Outputs are removed an hour after the prediction completes. `Prefer: wait=60` in `headers` or `http.headers` holds
-  the submission open so a fast prediction costs one result read.
-- **Stability** — `stability.image(id)` generates inline; `stability.upscale()` is the creative upscaler, queued:
-
-```ts
-const stability = Stability.configure({ apiKey: process.env.STABILITY_API_KEY })
-const upscaled = Effect.gen(function* () {
-  const small = yield* Media.file("./small.png")
-  return yield* Image.generate(
-    { model: stability.upscale(), prompt: "A lighthouse", images: [small] },
-    { poll: { interval: "5 seconds" } },
-  )
-})
-```
-
 Imagen is not available: Google shut it down on the Gemini API, and Vertex discontinued the Imagen 4 models on
 2026-06-30. `Google.image(...)` uses Gemini-native image models.
 
@@ -957,7 +913,7 @@ The hosted result is represented as a provider-executed tool call and a tool res
 ## Video generation
 
 Video mirrors `Image` with one difference: every provider is asynchronous, so the route is a submit-then-poll
-`Generation`. Models come from `.video(...)` selectors on the `Google` (Veo), `XAI`, `Fal`, and `Runway` facades.
+`Generation`. Models come from `.video(...)` selectors on the `Google` (Veo), `XAI`, and `Runway` facades.
 Common fields (`frames`, `references`, `video`, `durationSeconds`, `aspect`, `resolution`, `audio`, `n`, `seed`,
 `negativePrompt`) lower natively or fail with a typed `AIError` before any network call; provider-native controls live
 under `providerOptions`, inferred from the selected model.
@@ -992,7 +948,7 @@ const controlled = Effect.gen(function* () {
   const generation = yield* Video.start({ model: google.video("veo-3.1-generate-preview"), prompt })
   generation.id // provider operation / task / request id
   generation.status // "queued" | "running" | "completed" | "failed" | "cancelled" | "expired"
-  generation.token // route-owned JSON: `{ operation }`, `{ requestID }`, `{ taskID }`, or fal's follow-up URLs
+  generation.token // route-owned JSON: `{ operation }`, `{ requestID }`, or `{ taskID }`
   // The token carries no route identity: persist the provider and model ID alongside it, since `resume` needs the model.
   const saved = JSON.stringify(generation.token)
 
@@ -1022,9 +978,6 @@ Provider notes:
   download, which the returned asset holds transiently (see above).
 - **xAI** sends a `video` input to `/videos/edits`, or `/videos/extensions` with `providerOptions.mode: "extend"`.
   `seed` and `negativePrompt` are not supported.
-- **fal** endpoints are model-specific: `durationSeconds`, `references`, and `frames.last` fail typed and belong in
-  `providerOptions` under the model's own names (`duration: "8s"`, `end_image_url`, …). Auth is
-  `Authorization: Key <FAL_KEY>`.
 - **Runway** expects pixel ratios in `aspect` for most models (`"1280:720"`), pins `X-Runway-Version`, reports
   `usage: { type: "credits" }`, and its output URLs expire after 24–48 hours.
 
@@ -1218,7 +1171,7 @@ Everything below is exported from `@opencode/ai/effect` unless noted.
 - **`Transcription.request` / `generate` / `stream` / `start` / `resume`** — speech-to-text over inline, streaming, and queued routes; `TranscriptionClient` is its Effect service and layer.
 - **`Decision.request` / `Decision.generate`** — typed predicate, choice, and score questions over text, JSON, and media input; `DecisionClient` is its Effect service and layer.
 - **`AIClient.layer` / `AIClient.layerWith(executor)`** — every modality client plus the request executor in one layer.
-- **`@opencode/ai`** (Promise root) — `AI.make({ layer? })` and a default `ai` client exposing `llm`, `image`, `video`, `speech`, `transcription`, and `decision` as Promise / `AsyncIterable` APIs, `run(effect)` for any package Effect, plus `file`, `write`, `bytes`, `base64`, and `materialize` for assets.
+- **`@opencode/ai`** (Promise root) — `AI.make({ layer?, clients? })` and a default `ai` client exposing `llm`, `image`, `video`, `speech`, `transcription`, and `decision` as Promise / `AsyncIterable` APIs, `run(effect)` for any package Effect, plus `file`, `write`, `bytes`, `base64`, and `materialize` for assets.
 - **`@opencode/ai/experimental`** — APIs that may still change: `Extraction` (typed values read out of text) and `Realtime` (`Realtime.connect` starts an OpenAI, xAI, or Gemini voice session and returns a WebRTC answer SDP or a short-lived WebSocket URL and token).
 
 ## Testing
@@ -1265,6 +1218,10 @@ For explicit compaction, script a `CompactionResponse` through `push`, `always`,
 
 For `compact(request, { mechanism: "trigger" })`, script a `CompactionCheckpointResponse` instead. It carries `checkpoint`, `responseID`, and optional `usage`. Endpoint and trigger calls reject each other's fixtures; both share the same queue, gates, lazy recording, and fallback controls.
 
+`TestImage`, `TestVideo`, `TestSpeech`, `TestTranscription`, and `TestDecision` follow the same pattern: `testLayer()` provides the modality's client and `Test`, with the same `push`, `always`, `serve`, `requests`, `wait`, and `gate` controls. Script an `ImageResponse` (or the modality's response) or an `AIError`. `stream` expands the response into its events, and `start` returns an already finished generation that `resume` accepts by token. Decision responses are returned as scripted, without checking the answers against the questions.
+
+The Promise client accepts the same layers as `AI.make({ clients: TestImage.testLayer() })`; `ai.run(TestImage.Test.use(...))` reaches the controls.
+
 The published legacy `Service`, `layer`, `clientLayer`, and module-level controls remain available as adapters
 over the same implementation, including the legacy live `requests` array. New tests should use `Test` and
 `testLayer`.
@@ -1290,6 +1247,8 @@ const compacted = Effect.gen(function* () {
   return yield* LLMClient.generate(next)
 })
 ```
+
+From the Promise API, `await ai.llm.compact(request)` takes the same request and options (plus `signal`) and returns the same result.
 
 `replacement` replaces the complete input window. Do not append it to the original transcript or extract only the encrypted item: the provider may retain additional messages in its output. Retained user and assistant messages remain ordinary messages with typed text, media, or reasoning parts, in their original order. Provider-specific message IDs, status, and phase use `providerMetadata`, not a raw output array hidden in an assistant message. Unsupported returned item types fail explicitly.
 
